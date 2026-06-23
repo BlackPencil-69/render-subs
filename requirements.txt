@@ -1,0 +1,7 @@
+customtkinter
+numpy
+Pillow
+moviepy
+faster-whisper
+torch
+ctranslate2
