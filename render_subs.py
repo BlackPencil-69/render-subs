@@ -166,7 +166,6 @@ _STRINGS: dict[str, dict[str, str]] = {
         "render_btn":       "▶  Render",
         "rendering":        "⏳  Rendering…",
         "open_folder":      "📂 Open Folder",
-        "log_label":        "Log / Errors:",
         "ui_language":      "Interface language:",
         "err_no_video":     "Please select a valid video file first.",
         "err_no_output":    "Please specify an output path.",
@@ -204,6 +203,12 @@ _STRINGS: dict[str, dict[str, str]] = {
         "preset_hint":      "(applies colour + text colour)",
         "color_hint":       "Box fill colour  ·  or active-word colour in Color mode",
         "text_color_hint":  '"auto" picks black/white for best contrast (Box mode)',
+        # MOV alpha export
+        "export_mov_check": "Also export subtitles-only .mov (transparent, no audio)",
+        "export_mov_hint":  "ProRes 4444 with alpha channel · no background video · no sound",
+        "exporting_mov":    "⏳ Exporting transparent .mov…",
+        "export_mov_done":  "Transparent .mov export complete.",
+        "export_mov_fail":  "Transparent .mov export failed: {}",
     },
     "Українська": {
         "title":            "🎵  Рендерер субтитрів у стилі TikTok",
@@ -243,7 +248,6 @@ _STRINGS: dict[str, dict[str, str]] = {
         "render_btn":       "▶  Рендер",
         "rendering":        "⏳  Рендерю…",
         "open_folder":      "📂 Відкрити папку",
-        "log_label":        "Лог / Помилки:",
         "ui_language":      "Мова інтерфейсу:",
         "err_no_video":     "Виберіть дійсний відеофайл.",
         "err_no_output":    "Вкажіть шлях до вихідного файлу.",
@@ -281,6 +285,12 @@ _STRINGS: dict[str, dict[str, str]] = {
         "preset_hint":      "(застосовує колір + колір тексту)",
         "color_hint":       "Колір заливки рамки  ·  або колір активного слова у режимі Color",
         "text_color_hint":  '"auto" обирає чорний/білий для найкращого контрасту (режим Box)',
+        # MOV alpha export
+        "export_mov_check": "Також експортувати лише субтитри у .mov (прозорий фон, без звуку)",
+        "export_mov_hint":  "ProRes 4444 з альфа-каналом · без фонового відео · без звуку",
+        "exporting_mov":    "⏳ Експортую прозорий .mov…",
+        "export_mov_done":  "Експорт прозорого .mov завершено.",
+        "export_mov_fail":  "Помилка експорту .mov: {}",
     },
 }
 
@@ -429,7 +439,6 @@ def _detect_device() -> str:
     try:
         import torch
         if torch.cuda.is_available():
-            # Quick validation – allocate a tiny tensor to confirm CUDA works
             try:
                 torch.zeros(1).cuda()
                 return "cuda"
@@ -457,23 +466,7 @@ def transcribe_to_subtitle_lines(
     cancel_flag: Optional[threading.Event] = None,
 ) -> list[list[dict]]:
     """
-    Transcribes *video_path* with Faster-Whisper and returns subtitle lines
-    in the same format used by parse_ass_karaoke():
-        [ [{"text": str, "start": float, "end": float}, ...], ... ]
-
-    Timing improvement: each word's end time is set to the *next* word's
-    start time (rather than the raw Whisper end), which removes gaps and
-    produces tighter karaoke feel.
-
-    Parameters
-    ----------
-    video_path        : path to the video (audio extracted internally)
-    model_name        : Faster-Whisper model size
-    language          : BCP-47 language code, or None for auto-detect
-    max_words_per_line: how many words appear per subtitle line
-    log_fn            : optional callable(str) for status messages
-    progress_fn       : optional callable(float 0–1) for progress updates
-    cancel_flag       : optional threading.Event; checked between segments
+    Transcribes *video_path* with Faster-Whisper and returns subtitle lines.
     """
     def _log(msg: str):
         if log_fn:
@@ -488,7 +481,6 @@ def transcribe_to_subtitle_lines(
     compute = "float16" if device == "cuda" else "int8"
     _log(f"Using device: {device.upper()}  |  model: {model_name}")
 
-    # ── 1. Extract audio to a temp WAV ──────────────────────────────────────
     _log("Extracting audio from video…")
     _prog(0.02)
 
@@ -507,7 +499,6 @@ def transcribe_to_subtitle_lines(
         raise RuntimeError(f"ffmpeg audio extraction failed: {exc}") from exc
 
     try:
-        # ── 2. Load model ────────────────────────────────────────────────────
         _log(f"Loading Faster-Whisper [{model_name}]…")
         _prog(0.05)
 
@@ -521,7 +512,6 @@ def transcribe_to_subtitle_lines(
         if cancel_flag and cancel_flag.is_set():
             return []
 
-        # ── 3. Transcribe ────────────────────────────────────────────────────
         lang_arg = None if (language is None or language == "Auto-detect") else language
         _log("Transcribing…")
         _prog(0.10)
@@ -534,23 +524,20 @@ def transcribe_to_subtitle_lines(
             vad_filter=True,
             vad_parameters=dict(
                 min_silence_duration_ms=400,
-                # Знижений поріг гучності — щоб ловити тихі/оброблені голоси
-                # (ефект радіо, ТВ, телефону):
                 min_speech_duration_ms=100,
                 speech_pad_ms=400,
-                threshold=0.35,          # замість дефолтного 0.5 — більш чутливо
+                threshold=0.35,
             ),
             condition_on_previous_text=True,
-            # Підказка моделі про можливий стиль мовлення (допомагає з обробленим звуком)
             initial_prompt=(
                 "Нижче наведено транскрипцію відео зі звичайним мовленням, "
                 "а також мовленням з ефектом радіо або телебачення."
                 if lang_arg in (None, "uk")
                 else None
             ),
-            no_speech_threshold=0.4,     # дефолт 0.6 — менш агресивно відкидає тихі шматки
-            log_prob_threshold=-1.2,     # дефолт -1.0 — трохи м'якше
-            compression_ratio_threshold=2.8,  # дефолт 2.4 — дозволяє більше повторень
+            no_speech_threshold=0.4,
+            log_prob_threshold=-1.2,
+            compression_ratio_threshold=2.8,
         )
 
         total_dur = info.duration if info.duration and info.duration > 0 else None
@@ -558,7 +545,6 @@ def transcribe_to_subtitle_lines(
         _log(f"Detected language: {detected}  |  duration: "
              f"{total_dur:.1f}s" if total_dur else "Detected language: " + detected)
 
-        # Collect all segments with word data
         all_segments = []
         t_start = time.monotonic()
 
@@ -594,7 +580,6 @@ def transcribe_to_subtitle_lines(
         _log(f"Transcription done. {len(all_segments)} segments found.")
         _prog(0.87)
 
-        # ── 4. Convert segments → subtitle lines ──────────────────────────
         subtitle_lines = _segments_to_word_lines(all_segments, max_words_per_line)
         _log(f"Built {len(subtitle_lines)} subtitle lines.")
         _prog(0.95)
@@ -608,21 +593,11 @@ def transcribe_to_subtitle_lines(
 
 
 def _clean_word_text(text: str) -> str:
-    """
-    Видаляє пробіл перед апострофом і дефісом, якщо після них іде літера.
-    Наприклад: "зроби ть" → "зробить", "по- думати" → "по-думати"
-    """
-    # Пробіл перед апострофом/дефісом (тільки якщо далі є буква — не тире в прямій мові)
     text = re.sub(r"\s+([''ʼ`\u2019\-])(?=\w)", r"\1", text)
     return text.strip()
 
 
 def _is_apostrophe_or_hyphen_join(prev_text: str, curr_text: str) -> bool:
-    """
-    Повертає True, якщо curr_text починається з апострофа або дефісу
-    (тобто поточне слово — це суфікс, який треба приклеїти до попереднього,
-    не переносячи на новий рядок).
-    """
     return bool(curr_text) and curr_text[0] in ("'", "'", "ʼ", "`", "\u2019", "-")
 
 
@@ -630,24 +605,10 @@ def _segments_to_word_lines(
     segments: list[dict],
     max_words_per_line: int,
 ) -> list[list[dict]]:
-    """
-    Converts Whisper segments (with per-word timestamps) into subtitle lines.
-
-    Key behaviours:
-    1. Пауза між сегментами (≥ VAD-threshold) → завжди новий рядок субтитру,
-       незалежно від ліміту слів.
-    2. Апостроф / дефіс на початку слова → слово «приклеюється» до попереднього
-       (не переноситься на новий рядок навіть якщо досягнуто ліміт).
-    3. Пробіли перед апострофом і дефісом очищаються у тексті слова.
-
-    Timing: word.end = next_word.start (tighter karaoke timing).
-    """
     lines: list[list[dict]] = []
 
     for seg in segments:
         words = seg.get("words", [])
-
-        # ── збираємо плоский список слів для цього сегмента ──────────────────
         seg_words: list[dict] = []
         if not words:
             text = _clean_word_text(seg.get("text", ""))
@@ -671,26 +632,18 @@ def _segments_to_word_lines(
         if not seg_words:
             continue
 
-        # ── тайтинги: кінець слова = початок наступного ───────────────────────
         for i in range(len(seg_words) - 1):
             next_start = seg_words[i + 1]["start"]
             if next_start is not None and next_start > seg_words[i]["start"]:
                 seg_words[i]["end"] = next_start
 
-        # ── розбиваємо сегмент на рядки по ліміту слів ────────────────────────
-        # Кожен сегмент починає новий рядок — це і є «пауза → новий рядок».
-        # (Попередній `current` буфер закривається автоматично, бо ми запускаємо
-        #  окремий цикл для кожного сегмента і одразу додаємо в lines.)
         current: list[dict] = []
 
         for w in seg_words:
             word_text = w["word"]
             word_entry = {"text": word_text, "start": w["start"], "end": w["end"]}
 
-            # Якщо поточне слово — апостроф/дефіс-суфікс, «приклеюємо» його
-            # до попереднього слова замість того щоб переносити на новий рядок.
             if current and _is_apostrophe_or_hyphen_join(current[-1]["text"], word_text):
-                # Зливаємо з попереднім словом без пробілу
                 prev = current[-1]
                 current[-1] = {
                     "text":  prev["text"] + word_text,
@@ -701,14 +654,12 @@ def _segments_to_word_lines(
 
             current.append(word_entry)
 
-            # Досягли ліміту — закриваємо рядок
             if len(current) >= max_words_per_line:
                 validated = _validate_word_timings(current)
                 if validated:
                     lines.append(validated)
                 current = []
 
-        # Залишок сегмента → окремий рядок
         if current:
             validated = _validate_word_timings(current)
             if validated:
@@ -780,7 +731,7 @@ def _wrap_words_to_rows(
 
 
 # ─────────────────────────────────────────────────────────────
-#  Frame renderer  — supports Box and Color highlight modes
+#  Frame renderer
 # ─────────────────────────────────────────────────────────────
 
 def create_word_highlight_frame(
@@ -798,15 +749,6 @@ def create_word_highlight_frame(
     stroke_color_rgba: tuple[int, int, int, int] = (0, 0, 0, 200),
     highlight_mode: str = "Box",
 ) -> np.ndarray | None:
-    """
-    Renders a single RGBA overlay frame.
-
-    highlight_mode
-    --------------
-    "Box"   — active word gets a filled rounded rectangle (original behaviour).
-    "Color" — active word is drawn in *box_color_rgba* colour (no rectangle);
-              inactive words are drawn semi-transparent white with stroke.
-    """
     font = _get_font(font_path, font_size)
     if font is None:
         return None
@@ -833,7 +775,6 @@ def create_word_highlight_frame(
     max_top     = vid_h - block_height - int(vid_h * 0.02)
     base_y      = max(int(vid_h * 0.02), min(desired_top, max_top))
 
-    # Active text colour (used in Box mode for text-on-box)
     if text_color_mode == "auto":
         active_fg = _auto_text_color(box_color_rgba)
     elif text_color_mode == "black":
@@ -841,7 +782,6 @@ def create_word_highlight_frame(
     else:
         active_fg = (255, 255, 255, 255)
 
-    # Inactive word colour
     inactive_fg = (255, 255, 255, inactive_alpha)
 
     padding_x = max(6, int(font_size * 0.35))
@@ -852,7 +792,6 @@ def create_word_highlight_frame(
         int(stroke_color_rgba[3] * inactive_alpha / 255),
     )
 
-    # Active word colour for Color mode = the highlight colour itself
     color_mode_active_fg = box_color_rgba[:3] + (255,)
 
     for row_idx, row_indices in enumerate(rows):
@@ -897,7 +836,6 @@ def create_word_highlight_frame(
 
             else:  # "Color" mode
                 if is_active:
-                    # Optional glow/shadow behind the highlighted word
                     if draw_shadow:
                         shadow_img  = Image.new("RGBA", (vid_w, vid_h), (0, 0, 0, 0))
                         shadow_draw = ImageDraw.Draw(shadow_img)
@@ -933,7 +871,7 @@ def create_word_highlight_frame(
 
 def render_dynamic_subs(
     video_path: str,
-    subtitle_source: list[list[dict]],  # pre-built lines from Whisper
+    subtitle_source: list[list[dict]],
     output_path: str,
     font_path: str,
     font_size: int,
@@ -951,11 +889,6 @@ def render_dynamic_subs(
     crf: int = 18,
     ffmpeg_preset: str = "fast",
 ) -> None:
-    """
-    Full render pipeline — runs in a background thread.
-
-    *subtitle_source*: already-built subtitle lines from Whisper transcription.
-    """
     frame_cache: dict[tuple, np.ndarray | None] = {}
 
     @contextmanager
@@ -970,9 +903,7 @@ def render_dynamic_subs(
         log_fn("Loading video…")
         with open_video(video_path) as video:
             vid_size: tuple[int, int] = tuple(video.size)
-
             lines = subtitle_source
-
             total_words = sum(len(ln) for ln in lines)
             log_fn(f"Found {len(lines)} lines, {total_words} words total.")
 
@@ -982,7 +913,6 @@ def render_dynamic_subs(
 
             clips = [video]
             processed = 0
-
             log_fn("Generating highlight frames…")
 
             for line_words in lines:
@@ -1078,13 +1008,169 @@ def render_dynamic_subs(
         done_fn(False, f"Render error: {exc}")
 
 
+def render_subs_only_mov(
+    video_path: str,
+    subtitle_source: list[list[dict]],
+    output_path: str,
+    font_path: str,
+    font_size: int,
+    box_color_rgba: tuple[int, int, int, int],
+    vertical_pct: float,
+    text_color_mode: str,
+    inactive_alpha: int,
+    draw_shadow: bool,
+    stroke_width: int,
+    stroke_color_rgba: tuple[int, int, int, int],
+    highlight_mode: str,
+    log_fn: Callable[[str], None],
+    done_fn: Callable[[bool, str], None],
+    progress_fn: Callable[[float], None] | None = None,
+) -> None:
+    """
+    Render ONLY the karaoke-subtitle overlay (no background video, no audio)
+    to a .mov file with an alpha channel, using the same word-highlight
+    frames as render_dynamic_subs(). Useful for compositing the subtitles
+    over other footage in a video editor.
+    """
+    frame_cache: dict[tuple, np.ndarray | None] = {}
+
+    @contextmanager
+    def open_video(path: str):
+        clip = VideoFileClip(path)
+        try:
+            yield clip
+        finally:
+            clip.close()
+
+    try:
+        log_fn("Loading video (for size/fps/duration reference only)…")
+        with open_video(video_path) as video:
+            vid_size: tuple[int, int] = tuple(video.size)
+            fps = video.fps
+            total_duration = video.duration
+            lines = subtitle_source
+            total_words = sum(len(ln) for ln in lines)
+            log_fn(f"[MOV export] {len(lines)} lines, {total_words} words total.")
+
+            if total_words == 0:
+                done_fn(False, "No subtitle words found for MOV export.")
+                return
+
+            clips = []
+            processed = 0
+            log_fn("Generating transparent subtitle frames…")
+
+            for line_words in lines:
+                line_key_base = tuple(w["text"] for w in line_words)
+
+                for i, w in enumerate(line_words):
+                    duration = w["end"] - w["start"]
+                    if duration < MIN_WORD_DURATION:
+                        processed += 1
+                        continue
+
+                    cache_key = (
+                        line_key_base, i,
+                        font_path, font_size,
+                        vid_size,
+                        box_color_rgba,
+                        vertical_pct,
+                        text_color_mode,
+                        inactive_alpha,
+                        draw_shadow,
+                        stroke_width,
+                        stroke_color_rgba,
+                        highlight_mode,
+                    )
+
+                    if cache_key in frame_cache:
+                        frame_array = frame_cache[cache_key]
+                    else:
+                        frame_array = create_word_highlight_frame(
+                            line_words,
+                            active_index=i,
+                            font_path=font_path,
+                            font_size=font_size,
+                            video_size=vid_size,
+                            box_color_rgba=box_color_rgba,
+                            vertical_pct=vertical_pct,
+                            text_color_mode=text_color_mode,
+                            inactive_alpha=inactive_alpha,
+                            draw_shadow=draw_shadow,
+                            stroke_width=stroke_width,
+                            stroke_color_rgba=stroke_color_rgba,
+                            highlight_mode=highlight_mode,
+                        )
+                        frame_cache[cache_key] = frame_array
+
+                    if frame_array is not None:
+                        clip = (
+                            ImageClip(frame_array)
+                            .with_start(w["start"])
+                            .with_duration(duration)
+                        )
+                        clips.append(clip)
+
+                    processed += 1
+                    if progress_fn and total_words > 0:
+                        progress_fn(0.6 * processed / total_words)
+                    if processed % 10 == 0:
+                        log_fn(
+                            f"  [MOV] Processed {processed}/{total_words} words "
+                            f"({int(100 * processed / total_words)}%)…"
+                        )
+
+            if not clips:
+                done_fn(False, "No subtitle frames generated for MOV export.")
+                return
+
+            log_fn("Compositing transparent subtitle track (this may take a while)…")
+            if progress_fn:
+                progress_fn(0.65)
+
+            out_dir = os.path.dirname(output_path)
+            if out_dir:
+                os.makedirs(out_dir, exist_ok=True)
+
+            # Fully transparent background, sized like the source video,
+            # spanning the full video duration so timing matches the source.
+            bg = ImageClip(
+                np.zeros((vid_size[1], vid_size[0], 4), dtype=np.uint8)
+            ).with_duration(total_duration)
+
+            final_video = CompositeVideoClip([bg, *clips])
+            try:
+                log_fn("Encoding transparent .mov (ProRes 4444, no audio)…")
+                final_video.write_videofile(
+                    output_path,
+                    fps=fps,
+                    codec="prores_ks",
+                    audio=False,
+                    ffmpeg_params=[
+                        "-pix_fmt", "yuva444p10le",
+                        "-profile:v", "4444",
+                        "-alpha_bits", "16",
+                    ],
+                    threads=min(os.cpu_count() or 4, 8),
+                    logger=None,
+                )
+            finally:
+                final_video.close()
+
+            if progress_fn:
+                progress_fn(1.0)
+
+            done_fn(True, f"MOV (alpha, no audio) saved to:\n{output_path}")
+
+    except Exception as exc:
+        done_fn(False, f"MOV export error: {exc}")
+
+
 # ─────────────────────────────────────────────────────────────
 #  UI Widgets
 # ─────────────────────────────────────────────────────────────
 
 class ColorButton(ctk.CTkFrame):
-    """Small square button that displays and lets the user pick a hex colour."""
-
     def __init__(self, master, initial_hex: str = "#8A2BE2",
                  on_change: Callable | None = None, **kwargs):
         super().__init__(master, **kwargs)
@@ -1121,40 +1207,42 @@ class ColorButton(ctk.CTkFrame):
 
 
 class PreviewPanel(ctk.CTkFrame):
-    """Live rendered preview of the subtitle style."""
+    _BG_COLOR = (26, 26, 26)
 
-    _BG_COLOR = (30, 30, 30)
-
-    def __init__(self, master, width: int = 540, height: int = 200, **kwargs):
+    def __init__(self, master, **kwargs):
         super().__init__(master, **kwargs)
-        self._prev_w = width
-        self._prev_h = height
         self._tk_img: ctk.CTkImage | None = None
         self._pending_after: str | None = None
         self._is_rendering = False
+        self._queued_params: dict | None = None
+
+        self._cached_video_path = ""
+        self._cached_bg_image: Image.Image | None = None
 
         self._label = ctk.CTkLabel(self, text="")
-        self._label.pack(fill="both", expand=True)
+        self._label.pack(fill="both", expand=True, padx=4, pady=4)
 
         self._status = ctk.CTkLabel(
             self, text="Preview will appear after fonts load.",
             text_color="gray50", font=ctk.CTkFont(size=11),
-        )  # preview panel always English
+        )
         self._status.pack(pady=(0, 4))
         self._show_placeholder()
 
     def _show_placeholder(self):
-        img  = Image.new("RGB", (self._prev_w, self._prev_h), self._BG_COLOR)
+        # Стандартне заглушкове полотно 16:9
+        img = Image.new("RGB", (480, 270), self._BG_COLOR)
         draw = ImageDraw.Draw(img)
-        draw.text((self._prev_w // 2, self._prev_h // 2), "Preview",
-                  fill=(80, 80, 80), anchor="mm")
+        draw.text((240, 135), "No video selected", fill=(70, 70, 70), anchor="mm")
         self._set_image(img)
 
     def _set_image(self, img: Image.Image):
+        # Встановлюємо динамічний розмір віджета відповідно до прорахованого кадру
         self._tk_img = ctk.CTkImage(light_image=img, dark_image=img, size=img.size)
         self._label.configure(image=self._tk_img, text="")
 
     def schedule_update(self, params: dict, delay_ms: int = 180):
+        self._queued_params = params
         if self._pending_after is not None:
             try:
                 self.after_cancel(self._pending_after)
@@ -1165,10 +1253,26 @@ class PreviewPanel(ctk.CTkFrame):
     def _start_render(self, params: dict):
         self._pending_after = None
         if self._is_rendering:
+            self._queued_params = params
             return
         self._is_rendering = True
+        self._queued_params = None
         self._status.configure(text="Rendering preview…")
         threading.Thread(target=self._render_worker, args=(params,), daemon=True).start()
+
+    def _scale_to_fit(self, image: Image.Image, max_w: int, max_h: int) -> Image.Image:
+        """Пропорційне масштабування без сплющування (Letterboxing)"""
+        w, h = image.size
+        aspect = w / h
+        
+        if w > max_w:
+            w = max_w
+            h = int(w / aspect)
+        if h > max_h:
+            h = max_h
+            w = int(h * aspect)
+            
+        return image.resize((w, h), Image.Resampling.LANCZOS)
 
     def _render_worker(self, params: dict):
         try:
@@ -1178,20 +1282,45 @@ class PreviewPanel(ctk.CTkFrame):
                     text="Select a valid font to see preview."))
                 return
 
-            font_size = max(10, min(params["font_size"], 80))
-
+            font_size = max(10, min(params["font_size"], 150))
             ui_lang = params.get("ui_lang", "English")
             sample_words = PREVIEW_SAMPLE_WORDS.get(ui_lang, PREVIEW_SAMPLE_WORDS["English"])
-            active_idx   = PREVIEW_ACTIVE_INDEX.get(ui_lang, 3)
+            active_idx   = PREVIEW_ACTIVE_INDEX.get(ui_lang, 2)
 
+            video_res = params.get("video_res", (1280, 720))
+            vid_w, vid_h = video_res
+            video_path = params.get("video_path", "")
+            
+            full_bg = None
+
+            # 1. Отримання оригінального повнорозмірного кадру
+            if video_path and os.path.isfile(video_path):
+                if video_path != self._cached_video_path:
+                    try:
+                        with VideoFileClip(video_path) as clip:
+                            # Беремо кадр на 2-й секунді (або посередині, якщо відео коротке)
+                            sample_time = min(2.0, clip.duration / 2)
+                            frame_rgb = clip.get_frame(sample_time)
+                            self._cached_bg_image = Image.fromarray(frame_rgb)
+                            self._cached_video_path = video_path
+                    except Exception:
+                        self._cached_bg_image = None
+                full_bg = self._cached_bg_image
+
+            if full_bg is None:
+                full_bg = Image.new("RGB", (vid_w, vid_h), (30, 30, 30))
+            else:
+                full_bg = full_bg.copy()
+
+            # 2. Рендеринг субтитрів на РЕАЛЬНІЙ роздільній здатності відео
             frame = create_word_highlight_frame(
                 line_words=sample_words,
                 active_index=active_idx,
                 font_path=font_path,
-                font_size=font_size,
-                video_size=(self._prev_w, self._prev_h),
+                font_size=font_size,      # Справжній розмір шрифту
+                video_size=(vid_w, vid_h), # Справжні розміри полотна відео
                 box_color_rgba=params["box_color_rgba"],
-                vertical_pct=0.5,
+                vertical_pct=params["vertical_pct"], # Справжня позиція
                 text_color_mode=params["text_color_mode"],
                 inactive_alpha=params["inactive_alpha"],
                 draw_shadow=params["draw_shadow"],
@@ -1201,28 +1330,34 @@ class PreviewPanel(ctk.CTkFrame):
             )
 
             if frame is None:
-                self.after(0, lambda: self._status.configure(
-                    text="Could not render preview (font error)."))
+                self.after(0, lambda: self._status.configure(text="Font error."))
                 return
 
-            bg = Image.new("RGB", (self._prev_w, self._prev_h), self._BG_COLOR)
+            # Накладання шару субтитрів
             overlay = Image.fromarray(frame)
-            bg.paste(overlay, mask=overlay.split()[3])
+            full_bg.paste(overlay, mask=overlay.split()[3])
+
+            # 3. Пропорційне стиснення фінальної композиції під інтерфейс програми
+            # Встановлюємо ліміти: наприклад, макс. 460 пікселів за шириною або висотою
+            final_preview_img = self._scale_to_fit(full_bg, 460, 460)
 
             mode_label = params.get("highlight_mode", "Box")
 
-            def apply(img=bg):
+            def apply(img=final_preview_img):
                 self._set_image(img)
                 self._status.configure(
-                    text=f"Live preview  ·  mode: {mode_label}  ·  active word highlighted")
+                    text=f"Live preview  ·  mode: {mode_label}  ·  {vid_w}x{vid_h}")
 
             self.after(0, apply)
 
         except Exception as exc:
-            self.after(0, lambda e=str(exc): self._status.configure(
-                text=f"Preview error: {e}"))
+            self.after(0, lambda e=str(exc): self._status.configure(text=f"Preview error: {e}"))
         finally:
             self._is_rendering = False
+            queued = self._queued_params
+            if queued is not None:
+                self._queued_params = None
+                self.after(0, lambda p=queued: self.schedule_update(p, delay_ms=0))
 
 
 # ─────────────────────────────────────────────────────────────
@@ -1230,8 +1365,6 @@ class PreviewPanel(ctk.CTkFrame):
 # ─────────────────────────────────────────────────────────────
 
 class App(ctk.CTk):
-    # ── Settings persistence ─────────────────────────────────────────────────
-
     _SETTINGS_FILE = os.path.join(
         os.path.expanduser("~"), ".tiktok_karaoke_settings.json"
     )
@@ -1279,7 +1412,7 @@ class App(ctk.CTk):
         ctk.set_default_color_theme("dark-blue")
 
         self.title("🎵 TikTok Karaoke Subtitle Renderer")
-        self.minsize(960, 740)
+        self.minsize(960, 640)
         self.resizable(True, True)
 
         self._fonts: dict[str, str] = {}
@@ -1289,7 +1422,6 @@ class App(ctk.CTk):
         self._last_output_path: str = ""
         self._subtitle_lines: list[list[dict]] | None = None
 
-        # Language selector var (needs to exist before _build_ui)
         self._ui_lang_var = ctk.StringVar(value="English")
 
         self._settings = self._load_settings()
@@ -1298,13 +1430,13 @@ class App(ctk.CTk):
         self._load_fonts()
         self.after(50, self._maximize_window)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
+        self._video_res: tuple[int, int] = (1280, 720) # Дефолтне значення до вибору відео
 
     def _on_close(self):
         self._save_settings()
         self.destroy()
 
     def _apply_saved_settings(self, s: dict):
-        """Restore persisted settings after UI is built."""
         if not s:
             return
         if "ui_language" in s:
@@ -1349,8 +1481,6 @@ class App(ctk.CTk):
             labels = [_t(L, k) for k, _, _ in QUALITY_OPTIONS]
             self._quality_combo.set(labels[idx] if idx < len(labels) else labels[0])
 
-    # ── Window helpers ───────────────────────────────────────────────────────
-
     def _maximize_window(self):
         system = platform.system()
         try:
@@ -1377,23 +1507,22 @@ class App(ctk.CTk):
         self.grid_rowconfigure(1, weight=0)  # title
         self.grid_rowconfigure(2, weight=1)  # scroll
         self.grid_rowconfigure(3, weight=0)  # quality
-        self.grid_rowconfigure(4, weight=0)  # buttons
-        self.grid_rowconfigure(5, weight=0)  # progress
-        self.grid_rowconfigure(6, weight=0)  # log
+        self.grid_rowconfigure(4, weight=0)  # mov export
+        self.grid_rowconfigure(5, weight=0)  # buttons
+        self.grid_rowconfigure(6, weight=0)  # progress
 
         self._build_lang_bar(PAD)
         self._build_title(PAD)
         self._build_scroll_area(PAD)
         self._build_buttons(PAD)
         self._build_progress(PAD)
-        self._build_log(PAD)
 
     def _build_lang_bar(self, PAD: int):
         bar = ctk.CTkFrame(self, fg_color="transparent")
         bar.grid(row=0, column=0, sticky="ew", padx=PAD, pady=(8, 0))
 
         self._lang_label_widget = ctk.CTkLabel(
-            bar, text="Interface language:", anchor="w", text_color="gray60")
+            bar, text=_t(self._ui_lang_var.get(), "ui_language"), anchor="w", text_color="gray60")
         self._lang_label_widget.pack(side="left")
 
         ctk.CTkSegmentedButton(
@@ -1405,16 +1534,13 @@ class App(ctk.CTk):
         ).pack(side="left", padx=(8, 0))
 
     def _on_lang_change(self, lang: str):
-        """Retranslate all dynamic UI labels."""
         L = lang
-        # Title / subtitle
         if hasattr(self, "_title_label"):
             self._title_label.configure(text=_t(L, "title"))
         if hasattr(self, "_subtitle_label"):
             self._subtitle_label.configure(text=_t(L, "subtitle"))
         if hasattr(self, "_lang_label_widget"):
             self._lang_label_widget.configure(text=_t(L, "ui_language"))
-        # File section
         for attr, key in [
             ("_video_label",  "video_file"),
             ("_output_label", "output_file"),
@@ -1424,7 +1550,6 @@ class App(ctk.CTk):
         for attr in ("_browse_video_btn", "_browse_output_btn"):
             if hasattr(self, attr):
                 getattr(self, attr).configure(text=_t(L, "browse"))
-        # Transcribe section
         if hasattr(self, "_whisper_section_label"):
             self._whisper_section_label.configure(text=_t(L, "whisper_section"))
         for attr, key in [
@@ -1441,7 +1566,6 @@ class App(ctk.CTk):
         if hasattr(self, "_words_per_line_label"):
             n = int(self._words_per_line_var.get())
             self._words_per_line_label.configure(text=_t(L, "words_unit", n))
-        # Options labels
         for attr, key in [
             ("_hl_mode_label",      "highlight_mode"),
             ("_preset_label",       "style_preset"),
@@ -1460,26 +1584,21 @@ class App(ctk.CTk):
                 getattr(self, attr).configure(text=_t(L, key))
         if hasattr(self, "_font_search_entry"):
             self._font_search_entry.configure(placeholder_text=_t(L, "font_search"))
-        # Preview
         if hasattr(self, "_preview_title_label"):
             self._preview_title_label.configure(text=_t(L, "live_preview"))
         if hasattr(self, "_refresh_btn"):
             self._refresh_btn.configure(text=_t(L, "refresh"))
-        # Buttons
         if hasattr(self, "_render_btn"):
             state = str(self._render_btn.cget("state"))
             if "disabled" not in state:
                 self._render_btn.configure(text=_t(L, "render_btn"))
         if hasattr(self, "_open_dir_btn"):
             self._open_dir_btn.configure(text=_t(L, "open_folder"))
-        if hasattr(self, "_log_label"):
-            self._log_label.configure(text=_t(L, "log_label"))
-        # Update quality combobox labels
-        if hasattr(self, "_quality_combo") and hasattr(self, "_quality_var"):
+        if hasattr(self, "_quality_combo") and hasattr(self, "_quality_idx"):
             opts = [_t(L, k) for k, _, _ in QUALITY_OPTIONS]
-            current_idx = self._quality_var.get()
+            current_idx = self._quality_idx
             self._quality_combo.configure(values=opts)
-            self._quality_combo.set(opts[current_idx] if isinstance(current_idx, int)
+            self._quality_combo.set(opts[current_idx] if 0 <= current_idx < len(opts)
                                     else opts[0])
         if hasattr(self, "_quality_label_widget"):
             self._quality_label_widget.configure(text=_t(L, "quality_label"))
@@ -1493,7 +1612,10 @@ class App(ctk.CTk):
             self._color_hint_label.configure(text=_t(L, "color_hint"))
         if hasattr(self, "_text_color_hint_label"):
             self._text_color_hint_label.configure(text=_t(L, "text_color_hint"))
-        # Refresh preview words for new language
+        if hasattr(self, "_export_mov_check"):
+            self._export_mov_check.configure(text=_t(L, "export_mov_check"))
+        if hasattr(self, "_export_mov_hint_label"):
+            self._export_mov_hint_label.configure(text=_t(L, "export_mov_hint"))
         self._request_preview()
 
     def _build_title(self, PAD: int):
@@ -1516,23 +1638,25 @@ class App(ctk.CTk):
         self._subtitle_label.pack(pady=(0, PAD))
 
     def _build_scroll_area(self, PAD: int):
-        scroll = ctk.CTkScrollableFrame(self, fg_color="transparent")
-        scroll.grid(row=2, column=0, sticky="nsew", padx=PAD)
-        scroll.grid_columnconfigure(0, weight=1)
-        scroll.grid_columnconfigure(1, weight=1)
+        main_container = ctk.CTkFrame(self, fg_color="transparent")
+        main_container.grid(row=2, column=0, sticky="nsew", padx=PAD)
+        
+        # Виправляємо пропорції: ліва колонка (0) розтягується (weight=1), 
+        # права колонка (1) займає стільки, скільки потрібно її контенту (weight=0)
+        main_container.grid_columnconfigure(0, weight=1)
+        main_container.grid_columnconfigure(1, weight=0)
+        main_container.grid_rowconfigure(0, weight=1)
 
-        left_frame = ctk.CTkFrame(scroll, fg_color="transparent")
-        left_frame.grid(row=0, column=0, sticky="nsew", padx=(0, PAD))
+        left_scroll = ctk.CTkScrollableFrame(main_container, fg_color="transparent")
+        left_scroll.grid(row=0, column=0, sticky="nsew", padx=(0, PAD))
 
-        self._build_file_section(left_frame, PAD)
-        self._build_transcribe_section(left_frame, PAD)
-        self._build_options_section(left_frame)
+        self._build_file_section(left_scroll, PAD)
+        self._build_transcribe_section(left_scroll, PAD)
+        self._build_options_section(left_scroll)
 
-        right_frame = ctk.CTkFrame(scroll, fg_color="transparent")
-        right_frame.grid(row=0, column=1, sticky="new")
+        right_frame = ctk.CTkFrame(main_container, fg_color="transparent")
+        right_frame.grid(row=0, column=1, sticky="nsew")
         self._build_preview_section(right_frame)
-
-    # ── File section ─────────────────────────────────────────────────────────
 
     def _build_file_section(self, parent, PAD: int):
         files_frame = ctk.CTkFrame(parent)
@@ -1547,7 +1671,6 @@ class App(ctk.CTk):
 
         L = self._ui_lang_var.get()
 
-        # Video row
         self._video_label = ctk.CTkLabel(
             files_frame, text=_t(L, "video_file"), anchor="w", width=110)
         self._video_label.grid(row=0, column=0, sticky="w", padx=12, pady=8)
@@ -1557,7 +1680,6 @@ class App(ctk.CTk):
             files_frame, text=_t(L, "browse"), width=80, command=self._browse_video)
         self._browse_video_btn.grid(row=0, column=2, padx=8, pady=8)
 
-        # Output row
         self._output_label = ctk.CTkLabel(
             files_frame, text=_t(L, "output_file"), anchor="w", width=110)
         self._output_label.grid(row=1, column=0, sticky="w", padx=12, pady=8)
@@ -1566,8 +1688,6 @@ class App(ctk.CTk):
         self._browse_output_btn = ctk.CTkButton(
             files_frame, text=_t(L, "browse"), width=80, command=self._browse_output)
         self._browse_output_btn.grid(row=1, column=2, padx=8, pady=8)
-
-    # ── Whisper / transcription section ─────────────────────────────────────
 
     def _build_transcribe_section(self, parent, PAD: int):
         frame = ctk.CTkFrame(parent)
@@ -1584,7 +1704,6 @@ class App(ctk.CTk):
         self._whisper_section_label.grid(
             row=0, column=0, columnspan=4, sticky="w", padx=12, pady=(10, 4))
 
-        # Model
         self._whisper_model_var = ctk.StringVar(value="Systran/faster-whisper-base")
         self._model_label = ctk.CTkLabel(frame, text=_t(L, "model"), anchor="w")
         self._model_label.grid(row=1, column=0, sticky="w", padx=12, pady=6)
@@ -1593,7 +1712,6 @@ class App(ctk.CTk):
             values=list(WHISPER_MODELS),
         ).grid(row=1, column=1, sticky="w", padx=4, pady=6)
 
-        # Language
         self._whisper_lang_var = ctk.StringVar(value="Auto-detect")
         self._lang_label = ctk.CTkLabel(frame, text=_t(L, "language"), anchor="w")
         self._lang_label.grid(row=1, column=2, sticky="w", padx=12, pady=6)
@@ -1602,7 +1720,6 @@ class App(ctk.CTk):
             values=list(WHISPER_LANGUAGES),
         ).grid(row=1, column=3, sticky="w", padx=4, pady=6)
 
-        # Words per line
         self._words_per_line_var = ctk.IntVar(value=5)
         self._wpl_label = ctk.CTkLabel(frame, text=_t(L, "words_per_line"), anchor="w")
         self._wpl_label.grid(row=2, column=0, sticky="w", padx=12, pady=6)
@@ -1617,7 +1734,6 @@ class App(ctk.CTk):
             frame, text=_t(L, "words_unit", 5), width=70)
         self._words_per_line_label.grid(row=2, column=2, sticky="w", padx=4)
 
-        # Transcribe button
         self._transcribe_btn = ctk.CTkButton(
             frame,
             text=_t(L, "transcribe_btn"),
@@ -1627,7 +1743,6 @@ class App(ctk.CTk):
         )
         self._transcribe_btn.grid(row=2, column=3, padx=12, pady=6, sticky="e")
 
-        # Status label
         self._transcribe_status = ctk.CTkLabel(
             frame,
             text=_t(L, "no_transcription"),
@@ -1647,8 +1762,6 @@ class App(ctk.CTk):
             text=_t(L, "words_changed"),
             text_color="gray60",
         )
-
-    # ── Style options ────────────────────────────────────────────────────────
 
     def _build_options_section(self, parent):
         opts = ctk.CTkFrame(parent)
@@ -1670,7 +1783,6 @@ class App(ctk.CTk):
         row = 0
         L = self._ui_lang_var.get()
 
-        # Highlight mode
         self._hl_mode_label = ctk.CTkLabel(
             opts, text=_t(L, "highlight_mode"), anchor="w")
         self._hl_mode_label.grid(row=row, column=0, sticky="w", padx=12, pady=8)
@@ -1688,7 +1800,6 @@ class App(ctk.CTk):
         ).grid(row=row, column=2, columnspan=2, sticky="w", padx=4)
         row += 1
 
-        # Style preset
         self._preset_label = ctk.CTkLabel(opts, text=_t(L, "style_preset"), anchor="w")
         self._preset_label.grid(
             row=row, column=0, sticky="w", padx=12, pady=8)
@@ -1701,7 +1812,6 @@ class App(ctk.CTk):
         self._preset_hint_label.grid(row=row, column=2, columnspan=2, sticky="w", padx=4)
         row += 1
 
-        # Font
         self._font_label = ctk.CTkLabel(opts, text=_t(L, "font"), anchor="w")
         self._font_label.grid(row=row, column=0, sticky="w", padx=12, pady=8)
         self._font_search_var.trace_add("write", self._filter_fonts)
@@ -1717,13 +1827,11 @@ class App(ctk.CTk):
         self._font_combo.grid(row=row, column=2, sticky="w", padx=4, pady=8)
         row += 1
 
-        # Font size
         self._font_size_label = self._add_slider_row(
             opts, row, _t(L, "font_size"), self._font_size_var,
             from_=24, to=120, fmt=_t(L, "px", "{}"), initial=_t(L, "px", 62))
         row += 1
 
-        # Highlight / box colour
         self._hl_color_label = ctk.CTkLabel(opts, text=_t(L, "highlight_color"), anchor="w")
         self._hl_color_label.grid(row=row, column=0, sticky="w", padx=12, pady=8)
         self._color_btn = ColorButton(
@@ -1733,25 +1841,21 @@ class App(ctk.CTk):
         self._color_hint_label.grid(row=row, column=2, columnspan=2, sticky="w", padx=4)
         row += 1
 
-        # Box opacity (only visible in Box mode, but harmless otherwise)
         self._box_opacity_label = self._add_slider_row(
             opts, row, _t(L, "box_opacity"), self._alpha_var,
             from_=50, to=255, fmt="{}", initial="230")
         row += 1
 
-        # Inactive opacity
         self._inact_opacity_label = self._add_slider_row(
             opts, row, _t(L, "inactive_opacity"), self._inactive_alpha_var,
             from_=30, to=255, fmt="{}", initial="160")
         row += 1
 
-        # Vertical position
         self._vpos_label = self._add_slider_row(
             opts, row, _t(L, "vertical_pos"), self._vpos_var,
             from_=0.1, to=0.95, fmt="{}%", initial="80%", is_pct=True)
         row += 1
 
-        # Text colour
         self._text_color_label = ctk.CTkLabel(opts, text=_t(L, "text_color"), anchor="w")
         self._text_color_label.grid(row=row, column=0, sticky="w", padx=12, pady=8)
         ctk.CTkComboBox(
@@ -1763,7 +1867,6 @@ class App(ctk.CTk):
         self._text_color_hint_label.grid(row=row, column=2, columnspan=2, sticky="w", padx=4)
         row += 1
 
-        # Drop shadow
         self._shadow_label = ctk.CTkLabel(opts, text=_t(L, "drop_shadow"), anchor="w")
         self._shadow_label.grid(row=row, column=0, sticky="w", padx=12, pady=8)
         ctk.CTkSwitch(
@@ -1772,13 +1875,11 @@ class App(ctk.CTk):
         ).grid(row=row, column=1, sticky="w", padx=4, pady=8)
         row += 1
 
-        # Stroke width
         self._stroke_w_label = self._add_slider_row(
             opts, row, _t(L, "stroke_width"), self._stroke_width_var,
             from_=0, to=8, fmt=_t(L, "px", "{}"), initial=_t(L, "px", 2))
         row += 1
 
-        # Stroke colour
         self._stroke_c_label = ctk.CTkLabel(opts, text=_t(L, "stroke_color"), anchor="w")
         self._stroke_c_label.grid(row=row, column=0, sticky="w", padx=12, pady=8)
         self._stroke_color_btn = ColorButton(
@@ -1788,10 +1889,7 @@ class App(ctk.CTk):
             row=row, column=2, columnspan=2, sticky="w", padx=4)
         row += 1
 
-    # ── Preview ──────────────────────────────────────────────────────────────
-
     def _build_preview_section(self, parent):
-        # Outer frame that stays at the top of the right column
         preview_frame = ctk.CTkFrame(parent)
         preview_frame.pack(fill="x", pady=(0, 16), anchor="n")
 
@@ -1812,15 +1910,13 @@ class App(ctk.CTk):
         self._refresh_btn.pack(side="right")
 
         self._preview = PreviewPanel(
-            preview_frame, width=PREVIEW_SIZE[0], height=PREVIEW_SIZE[1],
-            fg_color="#1a1a1a", corner_radius=10,
+            preview_frame, fg_color="#1a1a1a", corner_radius=10,
         )
         self._preview.pack(fill="x", padx=12, pady=(0, 12))
 
     # ── Bottom controls ──────────────────────────────────────────────────────
 
     def _build_buttons(self, PAD: int):
-        # ── Quality row ──────────────────────────────────────────────────────
         quality_frame = ctk.CTkFrame(self, fg_color="transparent")
         quality_frame.grid(row=3, column=0, sticky="ew", padx=PAD, pady=(8, 0))
 
@@ -1830,8 +1926,7 @@ class App(ctk.CTk):
             quality_frame, text=_t(L, "quality_label"), anchor="w")
         self._quality_label_widget.pack(side="left")
 
-        # Store selected index internally (0-3)
-        self._quality_idx = 0  # default: Visually Lossless
+        self._quality_idx = 0
         quality_labels = [_t(L, k) for k, _, _ in QUALITY_OPTIONS]
 
         self._quality_combo = ctk.CTkComboBox(
@@ -1849,9 +1944,24 @@ class App(ctk.CTk):
             text_color="gray60", font=ctk.CTkFont(size=11))
         self._quality_hint_label.pack(side="left")
 
-        # ── Action buttons row ────────────────────────────────────────────────
+        # ── Subtitles-only transparent .mov export ──────────────────────────
+        mov_frame = ctk.CTkFrame(self, fg_color="transparent")
+        mov_frame.grid(row=4, column=0, sticky="ew", padx=PAD, pady=(6, 0))
+
+        self._export_mov_var = ctk.BooleanVar(value=False)
+        self._export_mov_check = ctk.CTkCheckBox(
+            mov_frame, text=_t(L, "export_mov_check"),
+            variable=self._export_mov_var,
+        )
+        self._export_mov_check.pack(side="left")
+
+        self._export_mov_hint_label = ctk.CTkLabel(
+            mov_frame, text=_t(L, "export_mov_hint"),
+            text_color="gray60", font=ctk.CTkFont(size=11))
+        self._export_mov_hint_label.pack(side="left", padx=(10, 0))
+
         btn_frame = ctk.CTkFrame(self, fg_color="transparent")
-        btn_frame.grid(row=4, column=0, sticky="ew", padx=PAD, pady=(6, PAD))
+        btn_frame.grid(row=5, column=0, sticky="ew", padx=PAD, pady=(6, PAD))
 
         self._edit_subs_btn = ctk.CTkButton(
             btn_frame, text=_t(L, "edit_btn"),
@@ -1883,7 +1993,7 @@ class App(ctk.CTk):
 
     def _build_progress(self, PAD: int):
         progress_frame = ctk.CTkFrame(self, fg_color="transparent")
-        progress_frame.grid(row=5, column=0, sticky="ew", padx=PAD)
+        progress_frame.grid(row=6, column=0, sticky="ew", padx=PAD, pady=(0, PAD))
 
         self._progress = ctk.CTkProgressBar(progress_frame)
         self._progress.pack(fill="x", pady=(0, 6))
@@ -1892,25 +2002,7 @@ class App(ctk.CTk):
         self._progress_label = ctk.CTkLabel(progress_frame, text="", text_color="gray60")
         self._progress_label.pack(pady=(0, 4))
 
-    def _build_log(self, PAD: int):
-        log_frame = ctk.CTkFrame(self, fg_color="transparent")
-        log_frame.grid(row=6, column=0, sticky="nsew", padx=PAD, pady=(0, 4))
-        log_frame.grid_columnconfigure(0, weight=1)
-        log_frame.grid_rowconfigure(1, weight=1)
-
-        self._log_label = ctk.CTkLabel(
-            log_frame, text=_t(self._ui_lang_var.get(), "log_label"),
-            anchor="w", text_color="gray60")
-        self._log_label.grid(row=0, column=0, sticky="w", pady=(0, 2))
-
-        self._log_box = ctk.CTkTextbox(
-            log_frame, height=80,
-            font=ctk.CTkFont(family="Courier", size=12),
-        )
-        self._log_box.grid(row=1, column=0, sticky="nsew")
-        self._log_box.configure(state="disabled")
-
-    # ── Shared UI helper: file row ────────────────────────────────────────────
+    # ── Shared UI helpers ─────────────────────────────────────────────────────
 
     def _add_file_row(self, parent, row, label, var, command):
         ctk.CTkLabel(parent, text=label, anchor="w", width=110).grid(
@@ -1948,18 +2040,24 @@ class App(ctk.CTk):
                        ("All files", "*.*")])
         if path:
             self._video_var.set(path)
-            # Auto-fill output: same folder, "originalname_subs.mp4"
             base, _ = os.path.splitext(path)
             self._output_var.set(base + "_subs.mp4")
-            # Reset cached transcription when video changes
             self._subtitle_lines = None
+            
+            # Зчитуємо реальні розміри відео один раз при виборі
+            try:
+                with VideoFileClip(path) as clip:
+                    self._video_res = tuple(clip.size) # (ширина, висота)
+            except Exception:
+                self._video_res = (1280, 720)
+
             L = self._ui_lang_var.get()
             self._transcribe_status.configure(
                 text=_t(L, "new_video"),
                 text_color="gray60")
+            self._request_preview()
 
     def _browse_output(self):
-        # Pre-fill dialog with the current auto-generated name
         current = self._output_var.get().strip()
         init_dir  = os.path.dirname(current)  if current else os.path.expanduser("~")
         init_file = os.path.basename(current) if current else "output_subs.mp4"
@@ -2034,6 +2132,9 @@ class App(ctk.CTk):
                 if self._stroke_color_btn else (0, 0, 0, 200)
             ),
             "highlight_mode":    self._highlight_mode_var.get(),
+            "video_path":        self._video_var.get().strip(),
+            "video_res":         getattr(self, "_video_res", (1280, 720)), # Реальний розмір
+            "vertical_pct":      float(self._vpos_var.get()), # Реальній вертикальний зсув
         }
 
     def _request_preview(self, *_):
@@ -2068,7 +2169,7 @@ class App(ctk.CTk):
                     model_name=model_name,
                     language=lang,
                     max_words_per_line=words_per_ln,
-                    log_fn=self._log_thread_safe,
+                    log_fn=self._log,
                     progress_fn=self._update_progress,
                 )
                 self._subtitle_lines = lines
@@ -2092,11 +2193,9 @@ class App(ctk.CTk):
         self._progress.set(1.0 if success else 0.0)
         L2 = self._ui_lang_var.get()
         self._progress_label.configure(text=_t(L2, "ready") if success else _t(L2, "failed"))
-        # Auto-open editor after successful transcription
         if success and self._subtitle_lines:
             self.after(300, self._open_subtitle_editor)
 
-    # ── Render ────────────────────────────────────────────────────────────────
 
     # ── Subtitle editor ───────────────────────────────────────────────────────
 
@@ -2110,9 +2209,8 @@ class App(ctk.CTk):
         editor.title(_t(L, "edit_subs_title"))
         editor.geometry("780x600")
         editor.resizable(True, True)
-        editor.grab_set()  # modal
+        editor.grab_set()
 
-        # Header hint
         ctk.CTkLabel(
             editor,
             text=_t(L, "edit_subs_hint"),
@@ -2122,14 +2220,12 @@ class App(ctk.CTk):
             wraplength=740,
         ).pack(fill="x", padx=16, pady=(12, 4))
 
-        # Text area – one line per subtitle block, words separated by spaces
         textbox = ctk.CTkTextbox(
             editor,
             font=ctk.CTkFont(family="Courier", size=13),
         )
         textbox.pack(fill="both", expand=True, padx=16, pady=(0, 8))
 
-        # Populate with current lines
         lines_text = []
         for line_words in self._subtitle_lines:
             lines_text.append(" ".join(w["text"] for w in line_words))
@@ -2143,7 +2239,6 @@ class App(ctk.CTk):
                 if i < len(self._subtitle_lines):
                     orig = self._subtitle_lines[i]
                 else:
-                    # Extra lines: append after last with estimated timing
                     last_end = self._subtitle_lines[-1][-1]["end"] if self._subtitle_lines else 0.0
                     gap = 2.0
                     word_list = text_line.split()
@@ -2156,7 +2251,6 @@ class App(ctk.CTk):
                         t += wd
 
                 new_words_text = text_line.split()
-                # Redistribute timings from original line
                 orig_words = [w for w in orig]
                 n_orig = len(orig_words)
                 n_new  = len(new_words_text)
@@ -2202,6 +2296,8 @@ class App(ctk.CTk):
             command=editor.destroy,
         ).pack(side="left")
 
+    # ── Render ────────────────────────────────────────────────────────────────
+
     def _start_render(self):
         L = self._ui_lang_var.get()
         video  = self._video_var.get().strip()
@@ -2218,27 +2314,9 @@ class App(ctk.CTk):
             messagebox.showerror("Error", _t(L, "err_no_font", font_name))
             return
 
-        # Determine subtitle source (transcription only)
-        if self._subtitle_lines is not None:
-            subtitle_source: list = self._subtitle_lines
-            self._log("Using Whisper transcription for subtitles.")
-        else:
+        needs_transcribe = self._subtitle_lines is None
+        if needs_transcribe:
             if not messagebox.askyesno("No subtitles", _t(L, "no_subs_q")):
-                return
-            self._log(_t(L, "auto_transcribe"))
-            try:
-                lines = transcribe_to_subtitle_lines(
-                    video_path=video,
-                    model_name=self._whisper_model_var.get(),
-                    language=self._whisper_lang_var.get(),
-                    max_words_per_line=int(self._words_per_line_var.get()),
-                    log_fn=self._log_thread_safe,
-                    progress_fn=self._update_progress,
-                )
-                self._subtitle_lines = lines
-                subtitle_source = lines
-            except Exception as exc:
-                messagebox.showerror(_t(L, "transcribe_fail2"), str(exc))
                 return
 
         self._last_output_path = output
@@ -2255,6 +2333,9 @@ class App(ctk.CTk):
             if self._stroke_color_btn else (0, 0, 0, 200)
         )
         highlight_mode = self._highlight_mode_var.get()
+        model_name     = self._whisper_model_var.get()
+        whisper_lang   = self._whisper_lang_var.get()
+        words_per_line = int(self._words_per_line_var.get())
 
         self._render_btn.configure(state="disabled", text=_t(self._ui_lang_var.get(), "rendering"))
         self._open_dir_btn.configure(state="disabled")
@@ -2269,27 +2350,93 @@ class App(ctk.CTk):
         self._log(f"Color: {self._color_btn.get_hex()}  |  Text: {text_color_mode}")
         self._log(f"Stroke: {stroke_width}px  |  Shadow: {draw_shadow}")
 
-        # Read quality selection
         q_idx = getattr(self, "_quality_idx", 0)
         _, crf, ffmpeg_preset = QUALITY_OPTIONS[q_idx]
-        
+
         self._log(f"Quality: CRF={crf}  |  Preset: {ffmpeg_preset}")
+
+        export_mov = bool(getattr(self, "_export_mov_var", None) and self._export_mov_var.get())
+        mov_output_path = None
+        if export_mov:
+            base, _ext = os.path.splitext(output)
+            mov_output_path = base + "_subs_alpha.mov"
+            self._log(f"Also exporting subtitles-only .mov to: {mov_output_path}")
         self._log(f"{'─' * 50}")
 
-        self._render_thread = threading.Thread(
-            target=render_dynamic_subs,
-            args=(
+        def _run_pipeline():
+            subtitle_source: list
+
+            if needs_transcribe:
+                self._log(_t(self._ui_lang_var.get(), "auto_transcribe"))
+                try:
+                    lines = transcribe_to_subtitle_lines(
+                        video_path=video,
+                        model_name=model_name,
+                        language=whisper_lang,
+                        max_words_per_line=words_per_line,
+                        log_fn=self._log,
+                        progress_fn=self._update_progress,
+                    )
+                    self._subtitle_lines = lines
+                    subtitle_source = lines
+                except Exception as exc:
+                    L2 = self._ui_lang_var.get()
+                    self.after(0, lambda e=str(exc): messagebox.showerror(
+                        _t(L2, "transcribe_fail2"), e))
+                    self.after(0, lambda: self._render_btn.configure(
+                        state="normal", text=_t(self._ui_lang_var.get(), "render_btn")))
+                    return
+            else:
+                subtitle_source = self._subtitle_lines
+                self._log("Using Whisper transcription for subtitles.")
+
+            render_args = (
                 video, subtitle_source, output,
                 font_path, font_size, box_rgba, vpos,
                 text_color_mode, inactive_alpha, draw_shadow,
                 stroke_width, stroke_color_rgba,
                 highlight_mode,
-                self._log_thread_safe,
+                self._log,
                 self._on_render_done,
                 self._update_progress,
                 crf,
                 ffmpeg_preset,
-            ),
+            )
+
+            render_dynamic_subs(*render_args)
+
+            # Optional: subtitles-only transparent .mov, no audio
+            if export_mov and mov_output_path:
+                L2 = self._ui_lang_var.get()
+                self.after(0, lambda: self._progress_label.configure(
+                    text=_t(L2, "exporting_mov")))
+                self._log(f"\n{'─' * 50}")
+                self._log("Subtitles-only .mov export started")
+                self._log(f"{'─' * 50}")
+
+                def _mov_done(success: bool, msg: str):
+                    self._log(msg)
+                    def _re_enable():
+                        L3 = self._ui_lang_var.get()
+                        self._render_btn.configure(
+                            state="normal", text=_t(L3, "render_btn"))
+                        if not success:
+                            messagebox.showerror("MOV export failed", msg)
+                    self.after(0, _re_enable)
+
+                render_subs_only_mov(
+                    video, subtitle_source, mov_output_path,
+                    font_path, font_size, box_rgba, vpos,
+                    text_color_mode, inactive_alpha, draw_shadow,
+                    stroke_width, stroke_color_rgba,
+                    highlight_mode,
+                    self._log,
+                    _mov_done,
+                    self._update_progress,
+                )
+
+        self._render_thread = threading.Thread(
+            target=_run_pipeline,
             daemon=True,
         )
         self._render_thread.start()
@@ -2333,13 +2480,10 @@ class App(ctk.CTk):
     # ── Logging ───────────────────────────────────────────────────────────────
 
     def _log(self, msg: str):
-        self._log_box.configure(state="normal")
-        self._log_box.insert("end", msg + "\n")
-        self._log_box.see("end")
-        self._log_box.configure(state="disabled")
+        print(msg)
 
     def _log_thread_safe(self, msg: str):
-        self.after(0, lambda m=msg: self._log(m))
+        print(msg)
 
 
 # ─────────────────────────────────────────────────────────────
