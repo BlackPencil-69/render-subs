@@ -40,7 +40,7 @@ The system automatically checks for a compatible CUDA-enabled environment (NVIDI
 
 ### 1. Clone the Repository
 ```bash
-git clone [https://github.com/BlackPencil-69/render_subs.git](https://github.com/BlackPencil-69/render_subs.git)
+git clone https://github.com/BlackPencil-69/render_subs.git
 cd render_subs
 
 ```
